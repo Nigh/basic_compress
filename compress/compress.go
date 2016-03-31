@@ -66,6 +66,13 @@ func main() {
 			isErr(err)
 			hm.Compress(hFile, hOutput)
 			hOutput.Close()
+		} else if *cd == "dec" {
+			fmt.Println("Start decompress")
+			hOutput, err = os.Create(*outputFile)
+			isErr(err)
+			hm.Decompress(hFile, hOutput)
+			hOutput.Close()
+			fmt.Println("Decompress completed!")
 		}
 	default:
 		fmt.Println("invalid method name.")
