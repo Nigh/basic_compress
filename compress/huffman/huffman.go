@@ -43,6 +43,12 @@ type h_dict struct {
 	bits uint32
 }
 
+// huffman dict struct
+type bits struct {
+	l    uint8 // length(bit)
+	bits uint32
+}
+
 /*
 每个字典项占2bytes,分为l和r,
 如果l!=r,则表示此项非叶子项,
@@ -73,13 +79,13 @@ func (p *h_node) Decode_dict(dict *[]uint8) int {
 
 //为*h_node添加Encode_dict()方法，输出以此node为root的编码字典
 // 1 for left, 0 for right
-func (p *h_node) Encode_dict(dict *[]h_dict, length uint8, code uint32) {
+func (p *h_node) Encode_dict(dict *map[uint16]bits, bin bits) {
 	if p.left != nil {
-		p.left.Encode_dict(dict, length+1, code|(0x80000000>>length))
-		p.right.Encode_dict(dict, length+1, code&(^(0x80000000 >> length)))
+		p.left.Encode_dict(dict, bits{bin.l + 1, bin.bits | (0x80000000 >> bin.l)})
+		p.right.Encode_dict(dict, bits{bin.l + 1, bin.bits & (^(0x80000000 >> bin.l))})
 		return
 	}
-	*dict = append(*dict, h_dict{p.value, length, code})
+	(*dict)[p.value] = bits{bin.l, bin.bits}
 }
 
 func traverse(p *h_node, hOutput *os.File) {
@@ -101,18 +107,10 @@ func (p *h_node) Dot(index string) {
 	hOutput.Close()
 }
 
-type huffman_block struct {
-	blockLength uint16 // 块长度
-	dictLength  uint16 // 字典长度
-	// 数据长度=blockLength-dictLength
-	buffer [block_size]byte
-}
-
 func Compress(hFile *os.File, hOutput *os.File) {
-	//var cblock huffman_block
 	var block_index uint16 = 0
-	build_huffman_tree := func(buffer []byte) {
-		leaf := make(nodelist, 0, 256)
+	build_huffman_tree := func(buffer []byte) (leaf nodelist) {
+		leaf = make(nodelist, 0, 256)
 		// 1.统计
 		var table [256]uint16
 		for _, v := range buffer {
@@ -141,26 +139,53 @@ func Compress(hFile *os.File, hOutput *os.File) {
 			} else {
 				leaf[0].Dot(fmt.Sprintf("%d", block_index))
 				block_index += 1
-
-				dict_d := make([]uint8, 0, 256)
-				leaf[0].Decode_dict(&dict_d)
-				dict_e := make([]h_dict, 0, 256)
-				leaf[0].Encode_dict(&dict_e, 0, 0)
-				/*
-					for k, v := range dict_d {
-						if k&0x1 > 0 {
-							fmt.Println(v)
-						} else {
-							fmt.Print(k/2, ":", v, ",")
-						}
-					}
-					for _, v := range dict_e {
-						fmt.Printf("[%#02X,%d,%s]\n", v.n, v.l, string([]rune(fmt.Sprintf("%032b", v.bits))[:v.l]))
-					}
-				*/
 				break
 			}
 		}
+		return leaf
+	}
+	huffman_compress := func(hOutput *os.File, r_buf []byte, root *nodelist) {
+		// byte拼接
+		// n 表示最后一个元素占用的bit数
+		bits2byte := func(arr []byte, n uint8, bin bits) ([]byte, uint8) {
+			for bin.l > 0 {
+				if n == 0 {
+					arr = append(arr, 0)
+				}
+				arr[len(arr)-1] |= byte(bin.bits >> uint(n+24))
+				temp := 8 - n
+				if temp > bin.l {
+					n += bin.l
+				} else {
+					n = 0
+				}
+				if bin.l > temp {
+					bin.l -= temp
+				} else {
+					bin.l = 0
+				}
+				bin.bits <<= temp
+			}
+			ret := arr
+			return ret, n
+		}
+		// 生成编码字典
+		dict_e := make(map[uint16]bits)
+		(*root)[0].Encode_dict(&dict_e, bits{0, 0})
+		// 生成解码字典
+		dict_d := make([]uint8, 0, 256)
+		(*root)[0].Decode_dict(&dict_d)
+		// 写入解码字典
+		hOutput.Write([]byte{byte(len(dict_d) / 2)})
+		hOutput.Write(dict_d)
+		var n uint8 = 0
+		var t_bytes []byte // temp byte slice
+		for _, v := range r_buf {
+			bin := dict_e[uint16(v)]
+			t_bytes, n = bits2byte(t_bytes, n, bin)
+		}
+		t_bytes, n = bits2byte(t_bytes, n, dict_e[eob_mark])
+		hOutput.Write(t_bytes)
 	}
 	hFile.Seek(0, os.SEEK_SET)
 	hOutput.Seek(0, os.SEEK_SET)
@@ -168,13 +193,69 @@ func Compress(hFile *os.File, hOutput *os.File) {
 	for {
 		n, err := hFile.Read(buf)
 		if n > 0 {
-			build_huffman_tree(buf[:n])
+			tree := build_huffman_tree(buf[:n])
+			huffman_compress(hOutput, buf[:n], &tree)
 		}
 		if err != nil {
 			if err.Error() == "EOF" {
+				hOutput.Close()
 				return
 			} else {
 				panic(err)
+			}
+		}
+	}
+}
+
+func Decompress(hFile *os.File, hOutput *os.File) {
+	hFile.Seek(0, os.SEEK_SET)
+	hOutput.Seek(0, os.SEEK_SET)
+	var decode_ptr uint16 = 0 // 指向第n个节点(索引为2*n)
+	var debug_cnt uint32 = 0
+	huffman_decode := func(bytes byte, dict []byte) bool {
+		var i uint8
+		for i = 0; i < 8; i++ {
+			if bytes&(0x80>>i) > 0 {
+				decode_ptr = uint16(dict[decode_ptr*2])
+			} else {
+				decode_ptr = uint16(dict[decode_ptr*2+1])
+			}
+
+			if dict[decode_ptr*2] == dict[decode_ptr*2+1] { // decode
+				hOutput.Write([]byte{dict[decode_ptr*2]})
+				debug_cnt++
+				decode_ptr = 0
+			} else if uint16(dict[decode_ptr*2]) == decode_ptr && dict[decode_ptr*2+1] == 0 { // block end
+				decode_ptr = 0
+				return true
+			}
+		}
+		return false
+	}
+	for {
+		dictLength := make([]byte, 1)
+		// 读取字典长度
+		_, err := hFile.Read(dictLength)
+		if err != nil {
+			if err.Error() == "EOF" {
+				hOutput.Close()
+				return
+			} else {
+				panic(err)
+			}
+		}
+		// 读取字典
+		dict := make([]byte, uint16(dictLength[0])*2)
+		_, err = hFile.Read(dict)
+		// 解码
+		buffer := make([]byte, 0x1)
+		for {
+			_, err = hFile.Read(buffer)
+			if err != nil {
+				panic(err)
+			}
+			if huffman_decode(buffer[0], dict) {
+				break
 			}
 		}
 	}
