@@ -4,6 +4,7 @@ import (
 	"os"
 )
 
+// 最短压缩长度
 const cp_length uint8 = 4
 
 func Compress(hFile *os.File, hOutput *os.File) {
