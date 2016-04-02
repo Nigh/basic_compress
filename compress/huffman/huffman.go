@@ -15,7 +15,18 @@ import (
 	解决方案3:将绝对索引换成相对索引,但是需证明在最坏的情况下,都可以保证1个byte的相对索引可以访问到全部字典
 */
 
-const block_size uint16 = 0x8000
+/*
+	暂时采用方案1，
+	1. 使用12bit表示字典长度(结点数)(每个结点3bytes)
+	2. 每个结点均使用三个字节，左右索引分别占12bits
+	3. 第1,3字节分别表示左右索引的低8位，第2字节表示左右索引的高4位。
+*/
+
+// 解码字典结点size
+const dict_unit_size uint8 = 3
+
+var block_size uint16 = 0xFFFF
+
 const eob_mark uint16 = 0x1000
 
 type h_node struct {
@@ -58,10 +69,10 @@ type bits struct {
 }
 
 /*
-每个字典项占2bytes,分为l和r,
+每个字典项占4bytes,分为l和r,
 如果l!=r,则表示此项非叶子项,
-	其左右子枝分别为第l和r项,下标索引即为2*l和2*r
-	如果l的索引是它本身,且r==0,则此项为block结束标志
+	其左右子枝分别为偏移l和r项,下标索引即为this+4*l和this+4*r
+	如果l的索引是0x7FFF,且r==0,则此项为block结束标志
 如果l==r,则表示此项为叶子项,
 	l=其编码内容
 解码时,从根节点开始跟随bit流中的1或0,进行跳转,直到叶子,得到解码内容
@@ -70,16 +81,17 @@ type bits struct {
 func (p *h_node) Decode_dict(dict *[]uint8) int {
 	pos := len(*dict)
 	if p.left != nil {
-		*dict = append(*dict, 0, 0) // 占位
+		*dict = append(*dict, 0, 0, 0) // 占位
 		left := p.left.Decode_dict(dict)
 		right := p.right.Decode_dict(dict)
-		(*dict)[pos] = uint8(left / 2)
-		(*dict)[pos+1] = uint8(right / 2)
+		(*dict)[pos] = uint8((left / 3) & 0xFF)
+		(*dict)[pos+1] = uint8((((left / 3) >> 4) & 0xF0) | (((right / 3) >> 8) & 0x0F))
+		(*dict)[pos+2] = uint8((right / 3) & 0xFF)
 	} else {
 		if p.value == eob_mark {
-			*dict = append(*dict, uint8(pos/2), 0)
+			*dict = append(*dict, uint8(pos/3), uint8(((pos/3)>>4)&0xF0), 0)
 		} else {
-			*dict = append(*dict, uint8(p.value), uint8(p.value))
+			*dict = append(*dict, uint8(p.value), 0, uint8(p.value))
 		}
 	}
 	return pos
@@ -145,11 +157,13 @@ func Compress(hFile *os.File, hOutput *os.File) {
 				leaf = leaf[1:]
 				leaf[0] = &root
 			} else {
-				leaf[0].Dot(fmt.Sprintf("%d", block_index))
+				// uncomment this line to output the dot file of huffman tree
+				// leaf[0].Dot(fmt.Sprintf("%d", block_index))
 				block_index += 1
 				break
 			}
 		}
+		fmt.Println("len(leaf) =", len(leaf))
 		return leaf
 	}
 	huffman_compress := func(hOutput *os.File, r_buf []byte, root *nodelist) {
@@ -183,8 +197,8 @@ func Compress(hFile *os.File, hOutput *os.File) {
 		// 生成解码字典
 		dict_d := make([]uint8, 0, 256)
 		(*root)[0].Decode_dict(&dict_d)
-		// 写入解码字典
-		hOutput.Write([]byte{byte(len(dict_d) / 2)})
+		// 写入解码字典(2bytes LE)
+		hOutput.Write([]byte{byte((len(dict_d) / 3) & 0xFF), byte(((len(dict_d) / 3) >> 8) & 0xFF)})
 		hOutput.Write(dict_d)
 		var n uint8 = 0
 		var t_bytes []byte // temp byte slice
@@ -198,6 +212,7 @@ func Compress(hFile *os.File, hOutput *os.File) {
 	hFile.Seek(0, os.SEEK_SET)
 	hOutput.Seek(0, os.SEEK_SET)
 	buf := make([]byte, block_size)
+	//t_block_size := block_size
 	for {
 		n, err := hFile.Read(buf)
 		if n > 0 {
@@ -218,22 +233,29 @@ func Compress(hFile *os.File, hOutput *os.File) {
 func Decompress(hFile *os.File, hOutput *os.File) {
 	hFile.Seek(0, os.SEEK_SET)
 	hOutput.Seek(0, os.SEEK_SET)
-	var decode_ptr uint16 = 0 // 指向第n个节点(索引为2*n)
+	var decode_ptr uint16 = 0 // 指向第n个节点(索引为3*n)
 	var debug_cnt uint32 = 0
+	get_decode_lr := func(ptr uint16, flag bool, dict []byte) uint16 {
+		// flag: 1 for left, 0 for right
+		if flag {
+			return uint16(dict[ptr*3]) + (uint16(dict[ptr*3+1])<<4)&0xF00
+		} else {
+			return uint16(dict[ptr*3+2]) + (uint16(dict[ptr*3+1])<<8)&0xF00
+		}
+	}
 	huffman_decode := func(bytes byte, dict []byte) bool {
 		var i uint8
 		for i = 0; i < 8; i++ {
 			if bytes&(0x80>>i) > 0 {
-				decode_ptr = uint16(dict[decode_ptr*2])
+				decode_ptr = get_decode_lr(decode_ptr, true, dict)
 			} else {
-				decode_ptr = uint16(dict[decode_ptr*2+1])
+				decode_ptr = get_decode_lr(decode_ptr, false, dict)
 			}
-
-			if dict[decode_ptr*2] == dict[decode_ptr*2+1] { // decode
-				hOutput.Write([]byte{dict[decode_ptr*2]})
+			if dict[decode_ptr*3] == dict[decode_ptr*3+2] && dict[decode_ptr*3+1] == 0 { // decode
+				hOutput.Write([]byte{dict[decode_ptr*3]})
 				debug_cnt++
 				decode_ptr = 0
-			} else if uint16(dict[decode_ptr*2]) == decode_ptr && dict[decode_ptr*2+1] == 0 { // block end
+			} else if uint16(dict[decode_ptr*3])+(uint16(dict[decode_ptr*3+1])<<4)&0xF00 == decode_ptr && dict[decode_ptr*3+2] == 0 { // block end
 				decode_ptr = 0
 				return true
 			}
@@ -241,7 +263,7 @@ func Decompress(hFile *os.File, hOutput *os.File) {
 		return false
 	}
 	for {
-		dictLength := make([]byte, 1)
+		dictLength := make([]byte, 2)
 		// 读取字典长度
 		_, err := hFile.Read(dictLength)
 		if err != nil {
@@ -253,7 +275,7 @@ func Decompress(hFile *os.File, hOutput *os.File) {
 			}
 		}
 		// 读取字典
-		dict := make([]byte, uint16(dictLength[0])*2)
+		dict := make([]byte, (uint16(dictLength[0])|(uint16(dictLength[1])<<8))*3)
 		_, err = hFile.Read(dict)
 		// 解码
 		buffer := make([]byte, 0x1)
@@ -263,6 +285,7 @@ func Decompress(hFile *os.File, hOutput *os.File) {
 				panic(err)
 			}
 			if huffman_decode(buffer[0], dict) {
+				fmt.Println("EOB")
 				break
 			}
 		}
